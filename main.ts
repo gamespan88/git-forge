@@ -18,6 +18,9 @@
 
 import { createApp } from './app.ts';
 
+// The app behind this lifecycle is a single-process GitHub-compatible forge: git smart HTTP,
+// REST v3, GraphQL and MCP served from one in-memory store (see app.ts and its sibling modules).
+
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
