@@ -44,6 +44,9 @@ type IssueRec struct {
 	Labels   []string
 	Comments []*CommentRec
 	Seq      int
+
+	viewCache []byte // the issue's serialized REST view, valid while viewKey matches
+	viewKey   string
 }
 
 type PullRec struct {
@@ -76,6 +79,9 @@ type Repo struct {
 	DefaultBranch string
 	NextNumber    int
 	seqCounter    int
+
+	viewCache []byte // the repo's serialized REST view, valid while viewKey matches
+	viewKey   string
 }
 
 func NewRepo(id int, name, owner, description string, isPrivate bool) *Repo {

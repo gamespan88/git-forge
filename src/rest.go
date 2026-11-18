@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strconv"
@@ -78,6 +79,44 @@ func issueJson(repo *Repo, issue *IssueRec) Json {
 		"created_at": repo.CreatedAt,
 		"updated_at": repo.CreatedAt,
 	}
+}
+
+// issueViewBytes returns the issue's serialized REST view (the exact bytes Send writes),
+// cached on the record. The cache key is a fingerprint of every mutable field the view
+// renders, so any mutation — a PATCH, a new comment, a GraphQL close — misses the cache and
+// rebuilds, with no invalidation bookkeeping at the mutation sites.
+func issueViewBytes(repo *Repo, issue *IssueRec) []byte {
+	key := issue.State + "\x00" + issue.Title + "\x00" + issue.Body + "\x00" +
+		strings.Join(issue.Labels, "\x00") + "\x00" + strconv.Itoa(len(issue.Comments))
+	if issue.viewCache != nil && issue.viewKey == key {
+		return issue.viewCache
+	}
+	data, _ := json.Marshal(issueJson(repo, issue))
+	data = append(data, '\n')
+	issue.viewCache = data
+	issue.viewKey = key
+	return data
+}
+
+// repoViewBytes is issueViewBytes for the repository view.
+func repoViewBytes(repo *Repo) []byte {
+	key := repo.Name + "\x00" + repo.Description + "\x00" + strconv.FormatBool(repo.IsPrivate) + "\x00" + repo.DefaultBranch
+	if repo.viewCache != nil && repo.viewKey == key {
+		return repo.viewCache
+	}
+	data, _ := json.Marshal(repoJson(repo))
+	data = append(data, '\n')
+	repo.viewCache = data
+	repo.viewKey = key
+	return data
+}
+
+// sendView writes pre-serialized JSON bytes with Send's headers.
+func sendView(ctx *Ctx, status int, data []byte) {
+	if ctx.W.Header().Get("Content-Type") == "" {
+		ctx.W.Header().Set("Content-Type", jsonType)
+	}
+	ctx.SendRaw(status, data)
 }
 
 func commentJson(comment *CommentRec) Json {
@@ -317,7 +356,7 @@ func handleRepo(ctx *Ctx, repo *Repo, segments []string) {
 	if len(segments) == 0 {
 		switch method {
 		case "GET":
-			ctx.Send(200, repoJson(repo))
+			sendView(ctx, 200, repoViewBytes(repo))
 		case "PATCH":
 			body := bodyObject(ctx)
 			if desc, ok := body["description"].(string); ok {
@@ -846,7 +885,7 @@ func handleIssues(ctx *Ctx, repo *Repo, segments []string) {
 	if len(segments) == 1 {
 		switch method {
 		case "GET":
-			ctx.Send(200, issueJson(repo, issue))
+			sendView(ctx, 200, issueViewBytes(repo, issue))
 		case "PATCH":
 			body := bodyObject(ctx)
 			if state, ok := body["state"].(string); ok && (state == "open" || state == "closed") {

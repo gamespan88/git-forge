@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/hex"
@@ -86,6 +87,68 @@ func inflateAt(buf []byte, offset int, expectedSize int) ([]byte, int, error) {
 		}
 	}
 	return out, offset + hi, nil
+}
+
+// countingByteReader serves a byte slice one byte at a time and remembers how far it got.
+type countingByteReader struct {
+	buf []byte
+	pos int
+}
+
+func (r *countingByteReader) ReadByte() (byte, error) {
+	if r.pos >= len(r.buf) {
+		return 0, io.EOF
+	}
+	b := r.buf[r.pos]
+	r.pos++
+	return b, nil
+}
+
+func (r *countingByteReader) Read(p []byte) (int, error) {
+	n := 0
+	for n < len(p) {
+		b, err := r.ReadByte()
+		if err != nil {
+			return n, err
+		}
+		p[n] = b
+		n++
+	}
+	return n, nil
+}
+
+// inflateExact inflates one zlib stream out of buf starting at offset in a single pass: the raw
+// deflate body is read through a byte-counting io.ByteReader, which compress/flate consumes
+// exactly (no read-ahead), so the stream's end is known to the byte without probing. A zlib
+// stream is a 2-byte header, the deflate body and a 4-byte adler32 trailer.
+func inflateExact(buf []byte, offset int, expectedSize int) ([]byte, int, error) {
+	if offset+2 > len(buf) {
+		return nil, 0, fmt.Errorf("truncated zlib header")
+	}
+	reader := &countingByteReader{buf: buf, pos: offset + 2}
+	fr := flate.NewReader(reader)
+	out, err := io.ReadAll(io.LimitReader(fr, int64(expectedSize)+1))
+	_ = fr.Close()
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(out) != expectedSize {
+		return nil, 0, fmt.Errorf("inflated %d bytes, expected %d", len(out), expectedSize)
+	}
+	next := reader.pos + 4 // the adler32 trailer
+	if next > len(buf) {
+		return nil, 0, fmt.Errorf("zlib stream overruns the pack")
+	}
+	return out, next, nil
+}
+
+// inflateAuto inflates one pack object: the exact single-pass reader first, with the probing
+// search of inflateAt as a safety net for any stream shape the exact reader misjudges.
+func inflateAuto(buf []byte, offset int, expectedSize int) ([]byte, int, error) {
+	if data, next, err := inflateExact(buf, offset, expectedSize); err == nil {
+		return data, next, nil
+	}
+	return inflateAt(buf, offset, expectedSize)
 }
 
 // applyDelta applies a git delta (the pack ofs-delta / ref-delta format) to a base object.
@@ -200,8 +263,17 @@ type pendingDelta struct {
 
 // IngestPack reads every object out of a packfile into this store. Deltas are resolved against
 // objects already in the store and objects read earlier from the same pack, in whatever order
-// they settle. Returns the ids written.
+// they settle. Returns the ids written. The first attempt inflates each object with the exact
+// single-pass reader; any failure retries the whole pack with the probing reader (objects are
+// content-addressed, so re-writing what the failed attempt placed is a no-op).
 func (s *ObjectStore) IngestPack(pack []byte) ([]string, error) {
+	if written, err := s.ingestPack(pack, inflateAuto); err == nil {
+		return written, nil
+	}
+	return s.ingestPack(pack, inflateAt)
+}
+
+func (s *ObjectStore) ingestPack(pack []byte, inflate func(buf []byte, offset int, expectedSize int) ([]byte, int, error)) ([]string, error) {
 	if len(pack) < 12+20 || string(pack[0:4]) != "PACK" {
 		return nil, fmt.Errorf("not a packfile")
 	}
@@ -243,7 +315,7 @@ func (s *ObjectStore) IngestPack(pack []byte) ([]string, error) {
 				pos++
 				baseOffset = ((baseOffset + 1) << 7) | int(c&0x7f)
 			}
-			data, next, err := inflateAt(pack, pos, size)
+			data, next, err := inflate(pack, pos, size)
 			if err != nil {
 				return nil, err
 			}
@@ -252,7 +324,7 @@ func (s *ObjectStore) IngestPack(pack []byte) ([]string, error) {
 		case 7: // ref-delta
 			baseSha := hex.EncodeToString(pack[pos : pos+20])
 			pos += 20
-			data, next, err := inflateAt(pack, pos, size)
+			data, next, err := inflate(pack, pos, size)
 			if err != nil {
 				return nil, err
 			}
@@ -263,13 +335,18 @@ func (s *ObjectStore) IngestPack(pack []byte) ([]string, error) {
 			if !ok {
 				return nil, fmt.Errorf("unknown pack object type %d", typeNum)
 			}
-			data, next, err := inflateAt(pack, pos, size)
+			data, next, err := inflate(pack, pos, size)
 			if err != nil {
 				return nil, err
 			}
 			pos = next
 			place(objType, data, start)
 		}
+	}
+	// A pack is header + objects + a 20-byte trailer: landing anywhere else means a stream
+	// boundary was misjudged, and the parse cannot be trusted.
+	if pos != len(pack)-20 {
+		return nil, fmt.Errorf("pack parse ended at %d, expected %d", pos, len(pack)-20)
 	}
 	for len(pending) > 0 {
 		progressed := false
