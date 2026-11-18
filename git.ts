@@ -369,7 +369,21 @@ export function ancestors(store: ObjectStore, tip: string): string[] {
 }
 
 export function isAncestor(store: ObjectStore, maybeAncestor: string, tip: string): boolean {
-  return ancestors(store, tip).includes(maybeAncestor);
+  // Depth-first from the tip with early exit: the common question ("is the ref's current tip an
+  // ancestor of the proposed new tip?") is answered by the first parent step, and only a true
+  // non-ancestor pays for the whole walk.
+  const seen = new Set<string>();
+  const stack = [tip];
+  while (stack.length > 0) {
+    const sha = stack.pop() as string;
+    if (seen.has(sha) || sha === ZERO_SHA) continue;
+    seen.add(sha);
+    const obj = store.get(sha);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    if (sha === maybeAncestor) return true;
+    for (const parent of parseCommit(obj.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** All objects reachable from a commit: the commit, its trees and blobs, and its history. */

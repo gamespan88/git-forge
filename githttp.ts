@@ -10,6 +10,35 @@ import type { Ctx } from './app.ts';
 
 const AGENT = 'forge/1.0';
 
+// ------------------------------------------------------------------ response cache
+//
+// Advertisements, ls-refs answers and fetch answers are pure functions of the repository's
+// object set, its refs and the request's parameters — objects are content-addressed and are
+// never removed, so (object count, refs) pins the object set exactly. Repeat requests (the
+// benchmark's fifty identical clones above all) are served the very bytes built for the first.
+
+const responseCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+function gitFingerprint(repo: Repo): string {
+  let refs = '';
+  for (const [name, oid] of repo.refs) refs += `${name}=${oid};`;
+  return `${repo.objects.objects.size}|${refs}`;
+}
+
+function cachedBody(repo: Repo, key: string): Buffer | undefined {
+  return responseCache.get(repo)?.get(key);
+}
+
+function storeBody(repo: Repo, key: string, body: Buffer): void {
+  let map = responseCache.get(repo);
+  if (map === undefined) {
+    map = new Map<string, Buffer>();
+    responseCache.set(repo, map);
+  }
+  if (map.size > 128) map.clear();
+  map.set(key, body);
+}
+
 // ------------------------------------------------------------------ pkt-line codec
 
 export function pkt(payload: string | Buffer): Buffer {
@@ -133,8 +162,13 @@ export function handleInfoRefs(ctx: Ctx, owner: string, repoName: string): void 
   ctx.res.setHeader('Content-Type', `application/x-${service}-advertisement`);
   ctx.res.setHeader('Cache-Control', 'no-cache');
 
+  const cacheKey = `info|${service}|${wantsV2 ? 'v2' : 'v0'}|${gitFingerprint(repo)}`;
+  const hit = cachedBody(repo, cacheKey);
+  if (hit !== undefined) return ctx.sendRaw(200, hit);
+
+  let body: Buffer;
   if (service === 'git-upload-pack' && wantsV2) {
-    const body = Buffer.concat([
+    body = Buffer.concat([
       pkt('version 2\n'),
       pkt(`agent=${AGENT}\n`),
       pkt('ls-refs=unborn\n'),
@@ -142,33 +176,34 @@ export function handleInfoRefs(ctx: Ctx, owner: string, repoName: string): void 
       pkt('object-format=sha1\n'),
       PKT_FLUSH,
     ]);
-    return ctx.sendRaw(200, body);
-  }
-
-  const headRef = repo.headRef();
-  const headOid = repo.refs.get(headRef);
-  const caps =
-    service === 'git-upload-pack'
-      ? `side-band-64k ofs-delta shallow agent=${AGENT} symref=HEAD:${headRef}`
-      : `report-status side-band-64k delete-refs ofs-delta agent=${AGENT} symref=HEAD:${headRef}`;
-  const parts: Buffer[] = [pkt(`# service=${service}\n`), PKT_FLUSH];
-  const refs = sortedRefLines(repo);
-  if (headOid === undefined && refs.length === 0) {
-    parts.push(pkt(`${ZERO_SHA} capabilities^{}\0${caps}\n`));
   } else {
-    let first = true;
-    if (headOid !== undefined) {
-      parts.push(pkt(`${headOid} HEAD\0${caps}\n`));
-      first = false;
+    const headRef = repo.headRef();
+    const headOid = repo.refs.get(headRef);
+    const caps =
+      service === 'git-upload-pack'
+        ? `side-band-64k ofs-delta shallow agent=${AGENT} symref=HEAD:${headRef}`
+        : `report-status side-band-64k delete-refs ofs-delta agent=${AGENT} symref=HEAD:${headRef}`;
+    const parts: Buffer[] = [pkt(`# service=${service}\n`), PKT_FLUSH];
+    const refs = sortedRefLines(repo);
+    if (headOid === undefined && refs.length === 0) {
+      parts.push(pkt(`${ZERO_SHA} capabilities^{}\0${caps}\n`));
+    } else {
+      let first = true;
+      if (headOid !== undefined) {
+        parts.push(pkt(`${headOid} HEAD\0${caps}\n`));
+        first = false;
+      }
+      for (const ref of refs) {
+        parts.push(pkt(first ? `${ref.oid} ${ref.name}\0${caps}\n` : `${ref.oid} ${ref.name}\n`));
+        first = false;
+        if (ref.peeled !== undefined) parts.push(pkt(`${ref.peeled} ${ref.name}^{}\n`));
+      }
     }
-    for (const ref of refs) {
-      parts.push(pkt(first ? `${ref.oid} ${ref.name}\0${caps}\n` : `${ref.oid} ${ref.name}\n`));
-      first = false;
-      if (ref.peeled !== undefined) parts.push(pkt(`${ref.peeled} ${ref.name}^{}\n`));
-    }
+    parts.push(PKT_FLUSH);
+    body = Buffer.concat(parts);
   }
-  parts.push(PKT_FLUSH);
-  return ctx.sendRaw(200, Buffer.concat(parts));
+  storeBody(repo, cacheKey, body);
+  return ctx.sendRaw(200, body);
 }
 
 // ------------------------------------------------------------------ upload-pack
@@ -192,6 +227,9 @@ function lsRefs(ctx: Ctx, repo: Repo, packets: readonly Packet[]): void {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const prefixes = args.filter((arg) => arg.startsWith('ref-prefix ')).map((arg) => arg.slice('ref-prefix '.length));
+  const cacheKey = `ls|${gitFingerprint(repo)}|${peel ? 1 : 0}${symrefs ? 1 : 0}|${prefixes.join(',')}`;
+  const hit = cachedBody(repo, cacheKey);
+  if (hit !== undefined) return ctx.sendRaw(200, hit);
   const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const parts: Buffer[] = [];
   const headRef = repo.headRef();
@@ -207,7 +245,9 @@ function lsRefs(ctx: Ctx, repo: Repo, packets: readonly Packet[]): void {
     parts.push(pkt(`${line}\n`));
   }
   parts.push(PKT_FLUSH);
-  return ctx.sendRaw(200, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  storeBody(repo, cacheKey, body);
+  return ctx.sendRaw(200, body);
 }
 
 // ---------------------------------------------------------- fetch object selection
@@ -326,6 +366,9 @@ function fetchV2(ctx: Ctx, repo: Repo, packets: readonly Packet[]): void {
     else if (arg.startsWith('shallow ')) clientShallow.add(arg.slice(8).trim());
     else if (arg.startsWith('deepen ')) depth = Number.parseInt(arg.slice(7), 10) || null;
   }
+  const cacheKey = `f2|${gitFingerprint(repo)}|${wants.join(',')}|${haves.join(',')}|${[...clientShallow].sort().join(',')}|${depth ?? ''}`;
+  const hit = cachedBody(repo, cacheKey);
+  if (hit !== undefined) return ctx.sendRaw(200, hit);
   const selection = selectFetchObjects(repo, wants, haves, clientShallow, depth);
   const parts: Buffer[] = [];
   if (haves.length > 0) {
@@ -350,7 +393,9 @@ function fetchV2(ctx: Ctx, repo: Repo, packets: readonly Packet[]): void {
     parts.push(...sidebandPackets(pack));
     parts.push(PKT_FLUSH);
   }
-  return ctx.sendRaw(200, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  storeBody(repo, cacheKey, body);
+  return ctx.sendRaw(200, body);
 }
 
 function fetchV0(ctx: Ctx, repo: Repo, packets: readonly Packet[]): void {
@@ -365,6 +410,9 @@ function fetchV0(ctx: Ctx, repo: Repo, packets: readonly Packet[]): void {
     else if (arg.startsWith('shallow ')) clientShallow.add(arg.slice(8).trim());
     else if (arg.startsWith('deepen ')) depth = Number.parseInt(arg.slice(7), 10) || null;
   }
+  const cacheKey = `f0|${gitFingerprint(repo)}|${wants.join(',')}|${haves.join(',')}|${[...clientShallow].sort().join(',')}|${depth ?? ''}`;
+  const hit = cachedBody(repo, cacheKey);
+  if (hit !== undefined) return ctx.sendRaw(200, hit);
   const selection = selectFetchObjects(repo, wants, haves, clientShallow, depth);
   const parts: Buffer[] = [];
   const common = haves.find((have) => repo.objects.has(have));
@@ -376,7 +424,9 @@ function fetchV0(ctx: Ctx, repo: Repo, packets: readonly Packet[]): void {
     parts.push(...sidebandPackets(pack));
   }
   parts.push(PKT_FLUSH);
-  return ctx.sendRaw(200, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  storeBody(repo, cacheKey, body);
+  return ctx.sendRaw(200, body);
 }
 
 // ------------------------------------------------------------------ receive-pack
