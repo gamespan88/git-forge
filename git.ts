@@ -313,8 +313,33 @@ export function parseCommit(data: Buffer): CommitInfo {
   return { tree, parents, author, committer, message };
 }
 
-export function serializeCommit(info: CommitInfo): Buffer {
-  const lines = [`tree ${info.tree}`];
+export interface TagInfo {
+  object: string;
+  type: string;
+  tag: string;
+  tagger: string;
+  message: string;
+}
+
+export function parseTag(data: Buffer): TagInfo {
+  const text = data.toString('utf8');
+  const split = text.indexOf('\n\n');
+  const head = split === -1 ? text : text.slice(0, split);
+  const headers = new Map<string, string>();
+  for (const line of head.split('\n')) {
+    const space = line.indexOf(' ');
+    if (space > 0) headers.set(line.slice(0, space), line.slice(space + 1));
+  }
+  return {
+    object: headers.get('object') ?? '',
+    type: headers.get('type') ?? '',
+    tag: headers.get('tag') ?? '',
+    tagger: headers.get('tagger') ?? '',
+    message: split === -1 ? '' : text.slice(split + 2),
+  };
+}
+
+export function serializeCommit(info: CommitInfo): Buffer {  const lines = [`tree ${info.tree}`];
   for (const parent of info.parents) lines.push(`parent ${parent}`);
   lines.push(`author ${info.author}`);
   lines.push(`committer ${info.committer}`);
